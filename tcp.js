@@ -1,175 +1,150 @@
 'use strict';
 
 const net = require('net');
-const { enqueueProxyLog } = require('./sql.js');
 
-const LISTEN_START = Number(process.env.LISTEN_START ?? 8100);
-const LISTEN_END = Number(process.env.LISTEN_END ?? 8200);
-const TARGET_HOST = process.env.TARGET_HOST ?? '127.0.0.1';
-const TARGET_PORT_OFFSET = Number(process.env.TARGET_PORT_OFFSET ?? 0);
-
-const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS ?? 200);
-const RECONNECT_MAX_BACKOFF_MS = Number(process.env.RECONNECT_MAX_BACKOFF_MS ?? 5000);
-const MAX_RECONNECT_RETRIES = Number(process.env.MAX_RECONNECT_RETRIES ?? -1);
-const TARGET_RECONNECT_DEBOUNCE_MS = Number(process.env.TARGET_RECONNECT_DEBOUNCE_MS ?? 50);
+const LISTEN_START = Number(process.env.TCP_LISTEN_START ?? 8100);
+const LISTEN_END = Number(process.env.TCP_LISTEN_END ?? 8200);
+const TARGET_HOSTS = (process.env.TCP_TARGET_HOST ?? '127.0.0.1')
+  .split(',')
+  .map((v) => v.trim())
+  .filter(Boolean);
+/** 수신 포트 + 오프셋 = Target 포트 (기본 0이면 8100 → Target 8100) */
+const TARGET_PORT_OFFSET = Number(process.env.TCP_TARGET_PORT_OFFSET ?? 0);
+const LOG_COALESCE_MS = Number(process.env.TCP_LOG_COALESCE_MS ?? 10);
 
 if (!Number.isFinite(LISTEN_START) || !Number.isFinite(LISTEN_END)) {
-  throw new Error('Invalid LISTEN_START/LISTEN_END');
+  throw new Error('Invalid TCP_LISTEN_START / TCP_LISTEN_END');
+}
+if (LISTEN_START > LISTEN_END) {
+  throw new Error('TCP_LISTEN_START must be <= TCP_LISTEN_END');
 }
 if (!Number.isFinite(TARGET_PORT_OFFSET)) {
-  throw new Error('Invalid TARGET_PORT_OFFSET');
+  throw new Error('Invalid TCP_TARGET_PORT_OFFSET');
 }
-if (!Number.isFinite(RECONNECT_BASE_MS) || RECONNECT_BASE_MS < 0) {
-  throw new Error('Invalid RECONNECT_BASE_MS');
+if (!Number.isFinite(LOG_COALESCE_MS) || LOG_COALESCE_MS < 0) {
+  throw new Error('Invalid TCP_LOG_COALESCE_MS');
 }
-if (!Number.isFinite(RECONNECT_MAX_BACKOFF_MS) || RECONNECT_MAX_BACKOFF_MS < 0) {
-  throw new Error('Invalid RECONNECT_MAX_BACKOFF_MS');
-}
-if (!Number.isFinite(TARGET_RECONNECT_DEBOUNCE_MS) || TARGET_RECONNECT_DEBOUNCE_MS < 0) {
-  throw new Error('Invalid TARGET_RECONNECT_DEBOUNCE_MS');
+if (TARGET_HOSTS.length < 1) {
+  throw new Error('TCP_TARGET_HOST must contain at least one host (comma separated)');
 }
 
-function safeDestroy(socket) {
-  if (!socket) return;
-  try {
-    socket.destroy();
-  } catch {
-    // ignore
-  }
+function targetPortFor(listenPort) {
+  return listenPort + TARGET_PORT_OFFSET;
 }
 
-function forwardTarget(listenPort) {
-  return `${TARGET_HOST}:${listenPort + TARGET_PORT_OFFSET}`;
+function kstNowString() {
+  return new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
 }
 
-function createTcpProxyServer(listenPort) {
-  const targetPort = listenPort + TARGET_PORT_OFFSET;
-  const targetLabel = forwardTarget(listenPort);
+function chunkToLogHex(chunk) {
+  const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  const hex = buf.toString('hex');
+  const max = 4096;
+  return hex.length > max ? `${hex.slice(0, max)}...` : hex;
+}
+
+function createProxyServer(listenPort) {
+  const tp = targetPortFor(listenPort);
 
   const server = net.createServer((clientSocket) => {
-    const clientAddr = `${clientSocket.remoteAddress ?? '-'}:${clientSocket.remotePort ?? '-'}`;
-    const tag = `[${listenPort}] ${clientAddr}`;
-    const clientIp = clientSocket.remoteAddress ?? '';
-    const clientRemotePort = clientSocket.remotePort ?? NaN;
+    const upstreams = new Map();
+    const peer = `${clientSocket.remoteAddress ?? '-'}:${clientSocket.remotePort ?? '-'}`;
+    let coalesceTimer = null;
+    const coalescedChunks = [];
+    const primaryHost = TARGET_HOSTS[0];
 
-    let closed = false;
-    let targetSocket = null;
-    let reconnectTimer = null;
-    let reconnectRetries = 0;
-    let lastTargetCloseAt = 0;
-    let onClientData = null;
 
-    const stopReconnectTimer = () => {
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
+    const handleUpstreamDown = (host) => {
+      const sock = upstreams.get(host);
+      if (sock && !sock.destroyed) {
+        sock.destroy();
       }
+      upstreams.delete(host);
     };
 
-    const closeAll = () => {
-      if (closed) return;
-      closed = true;
-      stopReconnectTimer();
-      if (onClientData) {
-        clientSocket.removeListener('data', onClientData);
-      }
-      safeDestroy(targetSocket);
-      clientSocket.destroy();
-    };
+    const ensureUpstream = (host) => {
+      const existing = upstreams.get(host);
+      if (existing && !existing.destroyed) return existing;
 
-    const scheduleReconnect = () => {
-      if (closed) return;
-      if (reconnectTimer) return;
-      if (MAX_RECONNECT_RETRIES >= 0 && reconnectRetries > MAX_RECONNECT_RETRIES) {
+      const upstream = net.createConnection({ host, port: tp });
+      upstreams.set(host, upstream);
+
+      upstream.on('error', (err) => {
         console.error(
-          `${tag} -> target ${targetLabel} reconnect failed: exceeded ${MAX_RECONNECT_RETRIES} retries`
+          `[${kstNowString()}] [${listenPort}] ${peer} upstream error ${host}:${tp} ->`,
+          err?.message ?? err
         );
-        closeAll();
-        return;
-      }
-
-      const debounceDelay = Math.max(0, TARGET_RECONNECT_DEBOUNCE_MS - (Date.now() - lastTargetCloseAt));
-      const backoff = Math.min(
-        RECONNECT_MAX_BACKOFF_MS,
-        RECONNECT_BASE_MS * Math.pow(2, reconnectRetries)
-      );
-      const delay = debounceDelay + backoff;
-
-      reconnectRetries += 1;
-      console.log(
-        `${tag} reconnecting -> ${targetLabel} (attempt ${reconnectRetries}, delay ${delay}ms)`
-      );
-
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connectTarget();
-      }, delay);
-    };
-
-    const cleanupPipesForTarget = (socketToUnpipe) => {
-      try {
-        if (socketToUnpipe) {
-          clientSocket.unpipe(socketToUnpipe);
-          socketToUnpipe.unpipe(clientSocket);
-        } else {
-          clientSocket.unpipe();
+        handleUpstreamDown(host);
+      });
+      upstream.on('close', () => handleUpstreamDown(host));
+      upstream.on('data', (chunk) => {
+        // 다중 Target 중 첫 번째 host 응답만 클라이언트로 전달
+        if (host === primaryHost && !clientSocket.destroyed) {
+          clientSocket.write(chunk);
         }
-      } catch {
-        // ignore
+      });
+      return upstream;
+    };
+
+    const flushSend = () => {
+      if (coalescedChunks.length === 0) return;
+      const merged = Buffer.concat(coalescedChunks);
+      coalescedChunks.length = 0;
+
+      for (const host of TARGET_HOSTS) {
+        const target = ensureUpstream(host);
+        if (!target || target.destroyed || !target.writable) {
+          console.log(
+            `[${kstNowString()}] [${listenPort}] ${peer} drop (upstream unavailable) ${host}:${tp}`
+          );
+          continue;
+        }
+        target.write(merged);
       }
+      console.log(
+        `[${kstNowString()}] [${listenPort}] ${peer} recv (${merged.length} bytes) hex: ${chunkToLogHex(merged)}`
+      );
+
     };
 
-    const connectTarget = () => {
-      if (closed) return;
-      stopReconnectTimer();
-
-      clientSocket.pause();
-      cleanupPipesForTarget(targetSocket);
-      safeDestroy(targetSocket);
-
-      const currentTarget = net.createConnection({ host: TARGET_HOST, port: targetPort });
-      targetSocket = currentTarget;
-
-      currentTarget.on('error', (err) => {
-        if (closed || targetSocket !== currentTarget) return;
-        console.error(`${tag} -> target ${targetLabel} error:`, err?.message ?? err);
-      });
-
-      currentTarget.on('close', () => {
-        if (closed || targetSocket !== currentTarget) return;
-        lastTargetCloseAt = Date.now();
-        scheduleReconnect();
-      });
-
-      currentTarget.once('connect', () => {
-        reconnectRetries = 0;
-        clientSocket.resume();
-        clientSocket.pipe(currentTarget, { end: false });
-        currentTarget.pipe(clientSocket, { end: false });
-      });
+    const flushRecvLog = () => {
+      if (coalescedChunks.length === 0) return;
+      const merged = Buffer.concat(coalescedChunks);
+      console.log(
+        `[${kstNowString()}] [${listenPort}] ${peer} recv (${merged.length} bytes) hex: ${chunkToLogHex(merged)}`
+      );
     };
 
-    clientSocket.on('error', closeAll);
-    clientSocket.on('close', () => closeAll());
 
-    onClientData = (chunk) => {
-      if (closed) return;
-      enqueueProxyLog({ ip: clientIp, port: clientRemotePort, chunk });
+    const flushCoalesced = () => {
+      coalesceTimer = null;
+      //flushRecvLog();
+      flushSend();
     };
-    clientSocket.on('data', onClientData);
 
-    clientSocket.on('end', () => {
-      stopReconnectTimer();
-      try {
-        if (targetSocket) targetSocket.end();
-      } catch {
-        // ignore
+    const cleanup = () => {
+      if (coalesceTimer) {
+        clearTimeout(coalesceTimer);
+        coalesceTimer = null;
       }
-      clientSocket.destroy();
+      flushCoalesced();
+      if (!clientSocket.destroyed) clientSocket.destroy();
+      for (const sock of upstreams.values()) {
+        if (!sock.destroyed) sock.destroy();
+      }
+      upstreams.clear();
+    };
+
+    clientSocket.on('error', cleanup);
+    clientSocket.on('close', cleanup);
+
+    clientSocket.on('data', (chunk) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      coalescedChunks.push(buf);
+      if (!coalesceTimer) {
+        coalesceTimer = setTimeout(flushCoalesced, LOG_COALESCE_MS);
+      }
     });
-
-    console.log(`[${new Date().toLocaleString('ko-KR')}] ${tag} -> ${targetLabel}`);
-    connectTarget();
   });
 
   server.on('error', (err) => {
@@ -179,32 +154,26 @@ function createTcpProxyServer(listenPort) {
   return server;
 }
 
-async function startTcpProxy() {
-  if (LISTEN_START > LISTEN_END) {
-    throw new Error('LISTEN_START must be <= LISTEN_END');
-  }
-
+function startTcpProxy() {
   const servers = [];
   let started = 0;
   const total = LISTEN_END - LISTEN_START + 1;
 
   for (let port = LISTEN_START; port <= LISTEN_END; port++) {
-    const server = createTcpProxyServer(port);
-    server.listen(port, () => {
+    const srv = createProxyServer(port);
+    srv.listen(port, () => {
       started += 1;
-      console.log(`Listening on :${port} (forward -> ${forwardTarget(port)}) [${started}/${total}]`);
+      console.log(
+        `Listening :${port} -> ${TARGET_HOSTS.map((h) => `${h}:${targetPortFor(port)}`).join(', ')} [${started}/${total}]`
+      );
     });
-    servers.push(server);
+    servers.push(srv);
   }
 
   console.log(
-    `TCP proxy range ready: ${LISTEN_START}..${LISTEN_END} -> ${forwardTarget(LISTEN_START)}..${forwardTarget(LISTEN_END)}`
+    `TCP proxy ready: ${LISTEN_START}..${LISTEN_END} -> ${TARGET_HOSTS.join(', ')} (offset ${TARGET_PORT_OFFSET})`
   );
-
   return servers;
 }
 
-module.exports = {
-  createTcpProxyServer,
-  startTcpProxy
-};
+module.exports = { startTcpProxy, createProxyServer };
