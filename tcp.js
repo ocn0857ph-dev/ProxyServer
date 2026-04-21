@@ -1,6 +1,9 @@
 'use strict';
 
 const net = require('net');
+const { insertTcpProxyLog } = require('./sql.js');
+const { sendTelegramMessage } = require('./telegram.js');
+
 
 const LISTEN_START = Number(process.env.TCP_LISTEN_START ?? 8100);
 const LISTEN_END = Number(process.env.TCP_LISTEN_END ?? 8200);
@@ -44,7 +47,7 @@ function chunkToLogHex(chunk) {
 }
 
 function createProxyServer(listenPort) {
-  const tp = targetPortFor(listenPort);
+  const hostPort = targetPortFor(listenPort);
 
   const server = net.createServer((clientSocket) => {
     const upstreams = new Map();
@@ -66,12 +69,12 @@ function createProxyServer(listenPort) {
       const existing = upstreams.get(host);
       if (existing && !existing.destroyed) return existing;
 
-      const upstream = net.createConnection({ host, port: tp });
+      const upstream = net.createConnection({ host, port: hostPort });
       upstreams.set(host, upstream);
 
       upstream.on('error', (err) => {
         console.error(
-          `[${kstNowString()}] [${listenPort}] ${peer} upstream error ${host}:${tp} ->`,
+          `[${kstNowString()}] [${listenPort}] ${peer} upstream error ${host}:${hostPort} ->`,
           err?.message ?? err
         );
         handleUpstreamDown(host);
@@ -91,34 +94,69 @@ function createProxyServer(listenPort) {
       const merged = Buffer.concat(coalescedChunks);
       coalescedChunks.length = 0;
 
+      console.log(
+        `[TCP] Recv [${listenPort}] ${peer} (${merged.length} bytes) hex: ${chunkToLogHex(merged)} [${kstNowString()}]`
+      );        
+      
+
       for (const host of TARGET_HOSTS) {
         const target = ensureUpstream(host);
         if (!target || target.destroyed || !target.writable) {
           console.log(
-            `[${kstNowString()}] [${listenPort}] ${peer} drop (upstream unavailable) ${host}:${tp}`
+            `[${kstNowString()}] [${listenPort}] ${peer} drop (upstream unavailable) ${host}:${hostPort}`
           );
           continue;
         }
-        target.write(merged);
+        try {
+          const ok = target.write(merged, (err) => {
+            if (err) {
+              // 전송 에러
+              console.error(
+                `[${kstNowString()}] [${listenPort}] ${peer} write error ${host}:${hostPort} ->`,
+                err?.message ?? err
+              ); 
+              
+              sendTelegramMessage(
+                `[${kstNowString()}] [${listenPort}] ${peer} write error ${host}:${hostPort} ->`,
+                err?.message ?? err
+              );
+            }
+            else {
+              // 전송 에러가 아니면
+              // DB에 로그 기록
+              insertTcpProxyLog({
+                sType: 'TCP',
+                sIp: clientSocket.remoteAddress ?? '',
+                sPort: listenPort ?? NaN,
+                chunk: merged,
+                tIp: host,
+                tPort: hostPort
+              });
+              console.log(
+                `[TCP] Send [${host}:${hostPort} (${merged.length} bytes) hex: ${chunkToLogHex(merged)} [${kstNowString()}]`
+              );
+            }
+          });
+          if (!ok) {
+            clientSocket.pause();
+            target.once('drain', () => {
+              if (!clientSocket.destroyed) clientSocket.resume();
+            });
+          }
+        } catch (err) {
+          console.error(
+            `[${kstNowString()}] [${listenPort}] ${peer} write threw ${host}:${hostPort} ->`,
+            err?.message ?? err
+          );
+        }
       }
-      console.log(
-        `[${kstNowString()}] [${listenPort}] ${peer} recv (${merged.length} bytes) hex: ${chunkToLogHex(merged)}`
-      );
 
-    };
-
-    const flushRecvLog = () => {
-      if (coalescedChunks.length === 0) return;
-      const merged = Buffer.concat(coalescedChunks);
-      console.log(
-        `[${kstNowString()}] [${listenPort}] ${peer} recv (${merged.length} bytes) hex: ${chunkToLogHex(merged)}`
-      );
     };
 
 
     const flushCoalesced = () => {
       coalesceTimer = null;
-      //flushRecvLog();
+      
       flushSend();
     };
 
