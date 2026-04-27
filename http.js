@@ -1,32 +1,21 @@
 'use strict';
 
 const http = require('http');
-const { insertHttpProxyLog } = require('./sql.js');
+const { insertHttpProxyLog, fetchHttpTargetHosts } = require('./sql.js');
 const { sendTelegramMessage } = require('./telegram.js');
 
-const HTTP_LISTEN_PORT = Number(process.env.HTTP_LISTEN_PORT ?? 8100);
-const TARGET_HOSTS = (process.env.HTTP_TARGET_HOST ?? '127.0.0.1')
-  .split(',')
-  .map((v) => v.trim())
-  .filter(Boolean);
-const TARGET_PORT_OFFSET = Number(process.env.HTTP_TARGET_PORT_OFFSET ?? 0);
+const HTTP_LISTEN_PORT = Number(process.env.HTTP_LISTEN_PORT ?? 8001);
 const BODY_MAX_BYTES = Number(process.env.HTTP_BODY_MAX_BYTES ?? 1048576);
 
 if (!Number.isFinite(HTTP_LISTEN_PORT) || HTTP_LISTEN_PORT < 1 || HTTP_LISTEN_PORT > 65535) {
   throw new Error('Invalid HTTP_LISTEN_PORT');
 }
-if (!Number.isFinite(TARGET_PORT_OFFSET)) {
-  throw new Error('Invalid HTTP_TARGET_PORT_OFFSET');
-}
-if (TARGET_HOSTS.length < 1) {
-  throw new Error('HTTP_TARGET_HOST must contain at least one host (comma separated)');
-}
 if (!Number.isFinite(BODY_MAX_BYTES) || BODY_MAX_BYTES < 1) {
   throw new Error('Invalid HTTP_BODY_MAX_BYTES');
 }
 
-function targetPortFor(listenPort) {
-  return listenPort + TARGET_PORT_OFFSET;
+function targetPortFor(listenPort, nOffset) {
+  return listenPort + nOffset;
 }
 
 function readRequestBody(req, maxBytes) {
@@ -92,8 +81,11 @@ function forwardJson(host, port, bodyBuf, meta) {
   });
 }
 
-function startHttpServer() {
-  const targetPort = targetPortFor(HTTP_LISTEN_PORT);
+async function startHttpServer() {
+  const hostsAtStart = await fetchHttpTargetHosts();
+  if (hostsAtStart.length < 1) {
+    throw new Error('tb_http_host_info must have at least one valid row (sIP, nOffset)');
+  }
 
   const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') {
@@ -142,11 +134,25 @@ function startHttpServer() {
       action: payload?.data?.action ?? ''
     };
 
-    for (const host of TARGET_HOSTS) {
-      forwardJson(host, targetPort, bodyBuf, meta).catch((err) => {
-        console.error(`[HTTP] forward error ${host}:${targetPort} ->`, err?.message ?? err);
+    let targetHosts;
+    try {
+      targetHosts = await fetchHttpTargetHosts();
+    } catch (err) {
+      console.error('[HTTP] fetchHttpTargetHosts on receive ->', err?.message ?? err);
+      return;
+    }
+    if (targetHosts.length < 1) {
+      console.error('[HTTP] tb_http_host_info has no valid rows, skip forward');
+      return;
+    }
 
-        sendTelegramMessage(`[HTTP] forward error ${host}:${targetPort} -> ${err?.message ?? err}`).catch(
+    for (const t of targetHosts) {
+      const port = targetPortFor(HTTP_LISTEN_PORT, t.nOffset);
+      const host = t.sIP;
+      forwardJson(host, port, bodyBuf, meta).catch((err) => {
+        console.error(`[HTTP] forward error ${host}:${port} ->`, err?.message ?? err);
+
+        sendTelegramMessage(`[HTTP] forward error ${host}:${port} -> ${err?.message ?? err}`).catch(
           (e) => console.error('[Telegram]', e?.message ?? e)
         );
       });
@@ -158,9 +164,10 @@ function startHttpServer() {
   });
 
   server.listen(HTTP_LISTEN_PORT, () => {
-    console.log(
-      `HTTP listening :${HTTP_LISTEN_PORT} -> ${TARGET_HOSTS.map((h) => `${h}:${targetPort}`).join(', ')} (offset ${TARGET_PORT_OFFSET})`
-    );
+    const summary = hostsAtStart
+      .map((h) => `${h.sIP}:${targetPortFor(HTTP_LISTEN_PORT, h.nOffset)}`)
+      .join(', ');
+    console.log(`HTTP listening :${HTTP_LISTEN_PORT} -> ${summary} (tb_http_host_info; refreshed each request)`);
   });
 
   return server;

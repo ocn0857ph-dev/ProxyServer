@@ -1,18 +1,11 @@
 'use strict';
 
 const net = require('net');
-const { insertTcpProxyLog } = require('./sql.js');
+const { insertTcpProxyLog, fetchTcpTargetHosts } = require('./sql.js');
 const { sendTelegramMessage } = require('./telegram.js');
-
 
 const LISTEN_START = Number(process.env.TCP_LISTEN_START ?? 8100);
 const LISTEN_END = Number(process.env.TCP_LISTEN_END ?? 8200);
-const TARGET_HOSTS = (process.env.TCP_TARGET_HOST ?? '127.0.0.1')
-  .split(',')
-  .map((v) => v.trim())
-  .filter(Boolean);
-/** 수신 포트 + 오프셋 = Target 포트 (기본 0이면 8100 → Target 8100) */
-const TARGET_PORT_OFFSET = Number(process.env.TCP_TARGET_PORT_OFFSET ?? 0);
 const LOG_COALESCE_MS = Number(process.env.TCP_LOG_COALESCE_MS ?? 10);
 
 if (!Number.isFinite(LISTEN_START) || !Number.isFinite(LISTEN_END)) {
@@ -21,18 +14,12 @@ if (!Number.isFinite(LISTEN_START) || !Number.isFinite(LISTEN_END)) {
 if (LISTEN_START > LISTEN_END) {
   throw new Error('TCP_LISTEN_START must be <= TCP_LISTEN_END');
 }
-if (!Number.isFinite(TARGET_PORT_OFFSET)) {
-  throw new Error('Invalid TCP_TARGET_PORT_OFFSET');
-}
 if (!Number.isFinite(LOG_COALESCE_MS) || LOG_COALESCE_MS < 0) {
   throw new Error('Invalid TCP_LOG_COALESCE_MS');
 }
-if (TARGET_HOSTS.length < 1) {
-  throw new Error('TCP_TARGET_HOST must contain at least one host (comma separated)');
-}
 
-function targetPortFor(listenPort) {
-  return listenPort + TARGET_PORT_OFFSET;
+function targetPortFor(listenPort, nOffset) {
+  return listenPort + nOffset;
 }
 
 function kstNowString() {
@@ -46,64 +33,87 @@ function chunkToLogHex(chunk) {
   return hex.length > max ? `${hex.slice(0, max)}...` : hex;
 }
 
+/**
+ * @param {number} listenPort
+ */
 function createProxyServer(listenPort) {
-  const hostPort = targetPortFor(listenPort);
-
   const server = net.createServer((clientSocket) => {
     const upstreams = new Map();
     const peer = `${clientSocket.remoteAddress ?? '-'}:${clientSocket.remotePort ?? '-'}`;
     let coalesceTimer = null;
     const coalescedChunks = [];
-    const primaryHost = TARGET_HOSTS[0];
+    /** 매 수신 배치마다 DB 조회 후 첫 번째 target 기준 (upstream 응답 라우팅) */
+    let primaryResponseKey = null;
 
-
-    const handleUpstreamDown = (host) => {
-      const sock = upstreams.get(host);
+    const handleUpstreamDown = (key) => {
+      const sock = upstreams.get(key);
       if (sock && !sock.destroyed) {
         sock.destroy();
       }
-      upstreams.delete(host);
+      upstreams.delete(key);
     };
 
-    const ensureUpstream = (host) => {
-      const existing = upstreams.get(host);
+    const ensureUpstream = (sIP, hostPort) => {
+      const key = `${sIP}:${hostPort}`;
+      const existing = upstreams.get(key);
       if (existing && !existing.destroyed) return existing;
 
-      const upstream = net.createConnection({ host, port: hostPort });
-      upstreams.set(host, upstream);
+      const upstream = net.createConnection({ host: sIP, port: hostPort });
+      upstreams.set(key, upstream);
 
       upstream.on('error', (err) => {
         console.error(
-          `[${kstNowString()}] [${listenPort}] ${peer} upstream error ${host}:${hostPort} ->`,
+          `[${kstNowString()}] [${listenPort}] ${peer} upstream error ${sIP}:${hostPort} ->`,
           err?.message ?? err
         );
-        handleUpstreamDown(host);
+        handleUpstreamDown(key);
       });
-      upstream.on('close', () => handleUpstreamDown(host));
+      upstream.on('close', () => handleUpstreamDown(key));
       upstream.on('data', (chunk) => {
-        // 다중 Target 중 첫 번째 host 응답만 클라이언트로 전달
-        if (host === primaryHost && !clientSocket.destroyed) {
+        // 다중 Target 중 (해당 배치의) 첫 번째 target 응답만 클라이언트로 전달
+        if (key === primaryResponseKey && !clientSocket.destroyed) {
           clientSocket.write(chunk);
         }
       });
       return upstream;
     };
 
-    const flushSend = () => {
+    const flushSend = async () => {
       if (coalescedChunks.length === 0) return;
       const merged = Buffer.concat(coalescedChunks);
       coalescedChunks.length = 0;
 
+      let targetHosts;
+      try {
+        targetHosts = await fetchTcpTargetHosts();
+      } catch (err) {
+        console.error(
+          `[${kstNowString()}] [${listenPort}] ${peer} fetchTcpTargetHosts failed ->`,
+          err?.message ?? err
+        );
+        return;
+      }
+      if (targetHosts.length < 1) {
+        console.error(
+          `[${kstNowString()}] [${listenPort}] ${peer} tb_tcp_host_info has no valid rows, drop ${merged.length} bytes`
+        );
+        return;
+      }
+
+      const primary = targetHosts[0];
+      primaryResponseKey = `${primary.sIP}:${targetPortFor(listenPort, primary.nOffset)}`;
+
       console.log(
         `[TCP] Recv [${listenPort}] ${peer} (${merged.length} bytes) hex: ${chunkToLogHex(merged)} [${kstNowString()}]`
-      );        
-      
+      );
 
-      for (const host of TARGET_HOSTS) {
-        const target = ensureUpstream(host);
+      for (const t of targetHosts) {
+        const hostPort = targetPortFor(listenPort, t.nOffset);
+        const sIP = t.sIP;
+        const target = ensureUpstream(sIP, hostPort);
         if (!target || target.destroyed || !target.writable) {
           console.log(
-            `[${kstNowString()}] [${listenPort}] ${peer} drop (upstream unavailable) ${host}:${hostPort}`
+            `[${kstNowString()}] [${listenPort}] ${peer} drop (upstream unavailable) ${sIP}:${hostPort}`
           );
           continue;
         }
@@ -112,16 +122,15 @@ function createProxyServer(listenPort) {
             if (err) {
               // 전송 에러
               console.error(
-                `[${kstNowString()}] [${listenPort}] ${peer} write error ${host}:${hostPort} ->`,
-                err?.message ?? err
-              ); 
-              
-              sendTelegramMessage(
-                `[${kstNowString()}] [${listenPort}] ${peer} write error ${host}:${hostPort} ->`,
+                `[${kstNowString()}] [${listenPort}] ${peer} write error ${sIP}:${hostPort} ->`,
                 err?.message ?? err
               );
-            }
-            else {
+
+              sendTelegramMessage(
+                `[${kstNowString()}] [${listenPort}] ${peer} write error ${sIP}:${hostPort} ->`,
+                err?.message ?? err
+              );
+            } else {
               // 전송 에러가 아니면
               // DB에 로그 기록
               insertTcpProxyLog({
@@ -129,11 +138,11 @@ function createProxyServer(listenPort) {
                 sIp: clientSocket.remoteAddress ?? '',
                 sPort: listenPort ?? NaN,
                 chunk: merged,
-                tIp: host,
+                tIp: sIP,
                 tPort: hostPort
               });
               console.log(
-                `[TCP] Send [${host}:${hostPort} (${merged.length} bytes) hex: ${chunkToLogHex(merged)} [${kstNowString()}]`
+                `[TCP] Send [${sIP}:${hostPort} (${merged.length} bytes) hex: ${chunkToLogHex(merged)} [${kstNowString()}]`
               );
             }
           });
@@ -145,7 +154,7 @@ function createProxyServer(listenPort) {
           }
         } catch (err) {
           console.error(
-            `[${kstNowString()}] [${listenPort}] ${peer} write threw ${host}:${hostPort} ->`,
+            `[${kstNowString()}] [${listenPort}] ${peer} write threw ${sIP}:${hostPort} ->`,
             err?.message ?? err
           );
         }
@@ -156,8 +165,12 @@ function createProxyServer(listenPort) {
 
     const flushCoalesced = () => {
       coalesceTimer = null;
-      
-      flushSend();
+      flushSend().catch((err) => {
+        console.error(
+          `[${kstNowString()}] [${listenPort}] ${peer} flushSend failed ->`,
+          err?.message ?? err
+        );
+      });
     };
 
     const cleanup = () => {
@@ -165,12 +178,22 @@ function createProxyServer(listenPort) {
         clearTimeout(coalesceTimer);
         coalesceTimer = null;
       }
-      flushCoalesced();
-      if (!clientSocket.destroyed) clientSocket.destroy();
-      for (const sock of upstreams.values()) {
-        if (!sock.destroyed) sock.destroy();
-      }
-      upstreams.clear();
+      void (async () => {
+        try {
+          await flushSend();
+        } catch (err) {
+          console.error(
+            `[${kstNowString()}] [${listenPort}] ${peer} flushSend (cleanup) ->`,
+            err?.message ?? err
+          );
+        } finally {
+          if (!clientSocket.destroyed) clientSocket.destroy();
+          for (const sock of upstreams.values()) {
+            if (!sock.destroyed) sock.destroy();
+          }
+          upstreams.clear();
+        }
+      })();
     };
 
     clientSocket.on('error', cleanup);
@@ -202,14 +225,14 @@ function startTcpProxy() {
     srv.listen(port, () => {
       started += 1;
       console.log(
-        `Listening :${port} -> ${TARGET_HOSTS.map((h) => `${h}:${targetPortFor(port)}`).join(', ')} [${started}/${total}]`
+        `Listening :${port} (targets from tb_tcp_host_info on each receive) [${started}/${total}]`
       );
     });
     servers.push(srv);
   }
 
   console.log(
-    `TCP proxy ready: ${LISTEN_START}..${LISTEN_END} -> ${TARGET_HOSTS.join(', ')} (offset ${TARGET_PORT_OFFSET})`
+    `TCP proxy ready: ${LISTEN_START}..${LISTEN_END} (tb_tcp_host_info loaded per client receive batch)`
   );
   return servers;
 }

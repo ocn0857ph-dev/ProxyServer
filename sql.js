@@ -159,8 +159,36 @@ function insertHttpProxyLog({ sIp, sPort, raw, timestamp, deive, action, tIp, tP
   }
 }
 
+/** @returns {Promise<Array<{ sIP: string, nOffset: number }>>} */
+async function fetchTcpTargetHosts() {
+  const [rows] = await mysqlPool.query(
+    'SELECT sIP, nOffset FROM tb_tcp_host_info'
+  );
+  return rows
+    .map((row) => ({
+      sIP: String(row.sIP != null ? row.sIP : '').trim(),
+      nOffset: Number(row.nOffset)
+    }))
+    .filter((r) => r.sIP && Number.isFinite(r.nOffset));
+}
+
+/** @returns {Promise<Array<{ sIP: string, nOffset: number }>>} */
+async function fetchHttpTargetHosts() {
+  const [rows] = await mysqlPool.query(
+    'SELECT sIP, nOffset FROM tb_http_host_info'
+  );
+  return rows
+    .map((row) => ({
+      sIP: String(row.sIP != null ? row.sIP : '').trim(),
+      nOffset: Number(row.nOffset)
+    }))
+    .filter((r) => r.sIP && Number.isFinite(r.nOffset));
+}
+
 module.exports = {
   insertTcpProxyLog,
   insertHttpProxyLog,
-  getPool: () => mysqlPool
+  getPool: () => mysqlPool,
+  fetchTcpTargetHosts,
+  fetchHttpTargetHosts
 };
